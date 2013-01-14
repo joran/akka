@@ -23,6 +23,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import akka.util.internal.HashedWheelTimer
 import concurrent.{ ExecutionContext, Await }
+import com.typesafe.config.ConfigFactory
 
 /**
  * Cluster Extension Id and factory for creating Cluster extension.
@@ -88,24 +89,26 @@ class Cluster(val system: ExtendedActorSystem) extends Extension {
    * INTERNAL API
    */
   private[cluster] val scheduler: Scheduler with Closeable = {
-    if (system.settings.SchedulerTickDuration > SchedulerTickDuration) {
+    if (system.scheduler.resolution > SchedulerTickDuration) {
+      import scala.collection.JavaConverters._
       log.info("Using a dedicated scheduler for cluster. Default scheduler can be used if configured " +
         "with 'akka.scheduler.tick-duration' [{} ms] <=  'akka.cluster.scheduler.tick-duration' [{} ms].",
-        system.settings.SchedulerTickDuration.toMillis, SchedulerTickDuration.toMillis)
+        system.scheduler.resolution.toMillis, SchedulerTickDuration.toMillis)
       new DefaultScheduler(
-        new HashedWheelTimer(log,
-          system.threadFactory match {
-            case tf: MonitorableThreadFactory ⇒ tf.withName(tf.name + "-cluster-scheduler")
-            case tf                           ⇒ tf
-          },
-          SchedulerTickDuration,
-          SchedulerTicksPerWheel),
-        log)
+        ConfigFactory.parseMap(Map("akka.scheduler.tick-duration" -> SchedulerTickDuration.toMillis).asJava).withFallback(
+          system.settings.config),
+        log,
+        system.threadFactory match {
+          case tf: MonitorableThreadFactory ⇒ tf.withName(tf.name + "-cluster-scheduler")
+          case tf                           ⇒ tf
+        })
     } else {
       // delegate to system.scheduler, but don't close over system
       val systemScheduler = system.scheduler
       new Scheduler with Closeable {
         override def close(): Unit = () // we are using system.scheduler, which we are not responsible for closing
+
+        override def resolution: FiniteDuration = systemScheduler.resolution
 
         override def schedule(initialDelay: FiniteDuration, interval: FiniteDuration,
                               receiver: ActorRef, message: Any)(implicit executor: ExecutionContext, sender: ActorRef = Actor.noSender): Cancellable =
@@ -123,7 +126,7 @@ class Cluster(val system: ExtendedActorSystem) extends Extension {
           systemScheduler.scheduleOnce(delay, runnable)
 
         override def scheduleOnce(delay: FiniteDuration, receiver: ActorRef,
-                                  message: Any)(implicit executor: ExecutionContext): Cancellable =
+                                  message: Any)(implicit executor: ExecutionContext, sender: ActorRef = Actor.noSender): Cancellable =
           systemScheduler.scheduleOnce(delay, receiver, message)
 
         override def scheduleOnce(delay: FiniteDuration)(f: ⇒ Unit)(implicit executor: ExecutionContext): Cancellable =

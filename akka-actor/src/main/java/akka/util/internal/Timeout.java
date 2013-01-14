@@ -52,5 +52,5 @@ public interface Timeout {
      * task has been executed or cancelled already, it will return with no
      * side effect.
      */
-    void cancel();
+    boolean cancel();
 }

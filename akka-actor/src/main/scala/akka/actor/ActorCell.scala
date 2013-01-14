@@ -287,7 +287,7 @@ private[akka] object ActorCell {
 
   final val emptyCancellable: Cancellable = new Cancellable {
     def isCancelled = false
-    def cancel() {}
+    def cancel() = false
   }
 
   final val emptyBehaviorStack: List[Actor.Receive] = Nil

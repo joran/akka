@@ -1,7 +1,6 @@
 package akka.actor
 
 import language.postfixOps
-
 import com.typesafe.config.ConfigFactory
 import org.scalatest.BeforeAndAfterEach
 import scala.concurrent.duration._
@@ -11,31 +10,27 @@ import scala.concurrent.Await
 import akka.pattern.ask
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.TimeoutException
+import java.util.concurrent.ThreadLocalRandom
+import scala.util.control.NonFatal
+import akka.event.LoggingAdapter
+import java.util.concurrent.ThreadFactory
+import scala.concurrent.ExecutionContext
+import com.typesafe.config.Config
 
 object SchedulerSpec {
   val testConf = ConfigFactory.parseString("""
     akka.scheduler.ticks-per-wheel = 32
   """).withFallback(AkkaSpec.testConf)
+
+  val testConfAkka = ConfigFactory.parseString("""
+    akka.scheduler.class = akka.actor.TestAkkaScheduler
+  """).withFallback(testConf)
 }
 
-@org.junit.runner.RunWith(classOf[org.scalatest.junit.JUnitRunner])
-class SchedulerSpec extends AkkaSpec(SchedulerSpec.testConf) with BeforeAndAfterEach with DefaultTimeout with ImplicitSender {
-  private val cancellables = new ConcurrentLinkedQueue[Cancellable]()
+trait SchedulerSpec extends BeforeAndAfterEach with DefaultTimeout with ImplicitSender { this: AkkaSpec ⇒
   import system.dispatcher
 
-  def collectCancellable(c: Cancellable): Cancellable = {
-    cancellables.add(c)
-    c
-  }
-
-  override def afterEach {
-    while (cancellables.peek() ne null) {
-      for (c ← Option(cancellables.poll())) {
-        c.cancel()
-        c.isCancelled must be === true
-      }
-    }
-  }
+  def collectCancellable(c: Cancellable): Cancellable
 
   "A Scheduler" must {
 
@@ -132,12 +127,12 @@ class SchedulerSpec extends AkkaSpec(SchedulerSpec.testConf) with BeforeAndAfter
     "be cancellable after initial delay" taggedAs TimingTest in {
       val ticks = new AtomicInteger
 
-      val initialDelay = 20.milliseconds.dilated
-      val delay = 200.milliseconds.dilated
+      val initialDelay = 90.milliseconds.dilated
+      val delay = 500.milliseconds.dilated
       val timeout = collectCancellable(system.scheduler.schedule(initialDelay, delay) {
         ticks.incrementAndGet()
       })
-      Thread.sleep((initialDelay + 100.milliseconds.dilated).toMillis)
+      Thread.sleep((initialDelay + 200.milliseconds.dilated).toMillis)
       timeout.cancel()
       Thread.sleep((delay + 100.milliseconds.dilated).toMillis)
 
@@ -238,6 +233,28 @@ class SchedulerSpec extends AkkaSpec(SchedulerSpec.testConf) with BeforeAndAfter
       // Rate
       n * 1000.0 / (System.nanoTime - startTime).nanos.toMillis must be(4.4 plusOrMinus 0.3)
     }
+
+    "survive being stressed without cancellation" taggedAs TimingTest in {
+      val r = ThreadLocalRandom.current()
+      val N = 100000
+      for (_ ← 1 to N) {
+        val next = r.nextInt(3000)
+        val now = System.nanoTime
+        system.scheduler.scheduleOnce(next.millis) {
+          val stop = System.nanoTime
+          testActor ! (stop - now - next * 1000000l)
+        }
+      }
+      val latencies = within(5.seconds) {
+        for (i ← 1 to N) yield try expectMsgType[Long] catch {
+          case NonFatal(e) ⇒ println(s"failed expecting the $i-th latency"); throw e
+        }
+      }
+      val histogram = latencies groupBy (_ / 100000000l)
+      for (k ← histogram.keys.toSeq.sorted) {
+        system.log.info(f"${k * 100}%3d: ${histogram(k).size}")
+      }
+    }
   }
 
   "A HashedWheelTimer" must {
@@ -266,4 +283,68 @@ class SchedulerSpec extends AkkaSpec(SchedulerSpec.testConf) with BeforeAndAfter
       }
     }
   }
+}
+
+class DefaultSchedulerSpec extends AkkaSpec(SchedulerSpec.testConf) with SchedulerSpec {
+  private val cancellables = new ConcurrentLinkedQueue[Cancellable]()
+
+  def collectCancellable(c: Cancellable): Cancellable = {
+    cancellables.add(c)
+    c
+  }
+
+  override def afterEach {
+    while (cancellables.peek() ne null) {
+      for (c ← Option(cancellables.poll())) {
+        c.cancel()
+        c.isCancelled must be === true
+      }
+    }
+  }
+}
+
+class AkkaSchedulerSpec extends AkkaSpec(SchedulerSpec.testConfAkka) with SchedulerSpec {
+  import system.dispatcher
+
+  def collectCancellable(c: Cancellable): Cancellable = c
+
+  "An AkkaScheduler" must {
+    "survive being stressed with cancellation" taggedAs TimingTest in {
+      val r = ThreadLocalRandom.current
+      val N = 1000000
+      val tasks = for (_ ← 1 to N) yield {
+        val next = r.nextInt(3000)
+        val now = System.nanoTime
+        system.scheduler.scheduleOnce(next.millis) {
+          val stop = System.nanoTime
+          testActor ! (stop - now - next * 1000000l)
+        }
+      }
+      // get somewhat into the middle of things
+      Thread.sleep(500)
+      val cancellations = for (t ← tasks) yield {
+        t.cancel()
+        if (t.isCancelled) 1 else 0
+      }
+      val cancelled = cancellations.sum
+      println(cancelled)
+      val latencies = within(5.seconds) {
+        for (i ← 1 to (N - cancelled)) yield try expectMsgType[Long] catch {
+          case NonFatal(e) ⇒ println(s"failed expecting the $i-th latency"); throw e
+        }
+      }
+      val histogram = latencies groupBy (_ / 100000000l)
+      for (k ← histogram.keys.toSeq.sorted) {
+        system.log.info(f"${k * 100}%3d: ${histogram(k).size}")
+      }
+      expectNoMsg(1.second)
+    }
+  }
+
+}
+
+class TestAkkaScheduler(config: Config,
+                        log: LoggingAdapter,
+                        threadFactory: ThreadFactory) extends AkkaScheduler(config, log, threadFactory) {
+
 }
