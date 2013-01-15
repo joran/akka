@@ -109,11 +109,9 @@ class AccrualFailureDetector(
 
   private val state = new AtomicReference[State](State())
 
-  /**
-   * Returns true if the connection is considered to be up and healthy
-   * and returns false otherwise.
-   */
-  def isAvailable(connection: Address): Boolean = phi(connection) < threshold
+  override def isAvailable(connection: Address): Boolean = phi(connection) < threshold
+
+  override def monitoringStarted(connection: Address): Boolean = state.get.timestamps.get(connection).nonEmpty
 
   /**
    * Records a heartbeat for a connection.

@@ -6,13 +6,12 @@ package akka.cluster
 import language.postfixOps
 
 import scala.collection.immutable
-import scala.annotation.tailrec
 import scala.concurrent.duration._
 import java.net.URLEncoder
 import akka.actor.{ ActorLogging, ActorRef, Address, Actor, RootActorPath, PoisonPill, Props }
 import akka.pattern.{ CircuitBreaker, CircuitBreakerOpenException }
 import akka.cluster.ClusterEvent._
-import akka.routing.ConsistentHash
+import akka.routing.MurmurHash
 
 /**
  * INTERNAL API
@@ -55,13 +54,26 @@ private[cluster] final class ClusterHeartbeatReceiver extends Actor with ActorLo
  */
 private[cluster] object ClusterHeartbeatSender {
   /**
-   * Tell [akka.cluster.ClusterHeartbeatSender]] that this node has started joining of
-   * another node and heartbeats should be sent unconditionally until it becomes
-   * member or deadline is overdue. This is done to be able to detect immediate death
-   * of the joining node.
+   * Request heartbeats from another node. Sent from the node that is
+   * expecting heartbeats from a specific sender, but has not received any.
+   */
+  case class HeartbeatRequest(from: Address) extends ClusterMessage
+
+  /**
+   * Delayed sending of a HeartbeatRequest. The actual request is
+   * only sent if no expected heartbeat message has been received.
    * Local only, no need to serialize.
    */
-  case class JoinInProgress(address: Address, deadline: Deadline)
+  case class SendHeartbeatRequest(to: Address)
+
+  /**
+   * Trigger a fake heartbeat message to trigger start of failure detection
+   * of a node that this node is expecting heartbeats from. HeartbeatRequest
+   * has been sent to the node so it should have started sending heartbeat
+   * messages.
+   * Local only, no need to serialize.
+   */
+  case class ExpectedFirstHeartbeat(from: Address)
 }
 
 /*
@@ -88,16 +100,16 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
 
   val selfHeartbeat = Heartbeat(selfAddress)
   val selfEndHeartbeat = EndHeartbeat(selfAddress)
+  val selfHeartbeatRequest = HeartbeatRequest(selfAddress)
 
-  var state = ClusterHeartbeatSenderState.empty(ConsistentHash(Seq.empty[Address], HeartbeatConsistentHashingVirtualNodesFactor),
-    selfAddress.toString, MonitoredByNrOfMembers)
+  var state = ClusterHeartbeatSenderState.empty(selfAddress, MonitoredByNrOfMembers)
 
   // start periodic heartbeat to other nodes in cluster
   val heartbeatTask = scheduler.schedule(PeriodicTasksInitialDelay max HeartbeatInterval,
     HeartbeatInterval, self, HeartbeatTick)
 
   override def preStart(): Unit = {
-    cluster.subscribe(self, classOf[MemberEvent])
+    cluster.subscribe(self, classOf[InstantMemberEvent])
     cluster.subscribe(self, classOf[UnreachableMember])
   }
 
@@ -112,18 +124,27 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
   def clusterHeartbeatConnectionFor(address: Address): ActorRef =
     context.actorFor(RootActorPath(address) / "system" / "cluster" / "heartbeatReceiver")
 
+  /**
+   * Looks up and returns the remote cluster heartbeat sender for the specific address.
+   */
+  def heartbeatSenderFor(address: Address): ActorRef = context.actorFor(self.path.toStringWithAddress(address))
+
   def receive = {
-    case HeartbeatTick          ⇒ heartbeat()
-    case s: CurrentClusterState ⇒ reset(s)
-    case UnreachableMember(m)   ⇒ removeMember(m)
-    case MemberDowned(m)        ⇒ removeMember(m)
-    case MemberRemoved(m)       ⇒ removeMember(m)
-    case e: MemberEvent         ⇒ addMember(e.member)
-    case JoinInProgress(a, d)   ⇒ addJoinInProgress(a, d)
+    case HeartbeatTick                ⇒ heartbeat()
+    case InstantMemberUp(m)           ⇒ addMember(m)
+    case UnreachableMember(m)         ⇒ removeMember(m)
+    case InstantMemberDowned(m)       ⇒ removeMember(m)
+    case InstantMemberRemoved(m)      ⇒ removeMember(m)
+    case s: InstantClusterState       ⇒ reset(s)
+    case _: CurrentClusterState       ⇒ // enough with InstantClusterState
+    case _: InstantMemberEvent        ⇒
+    case HeartbeatRequest(from)       ⇒ addHeartbeatRequest(from)
+    case SendHeartbeatRequest(to)     ⇒ sendHeartbeatRequest(to)
+    case ExpectedFirstHeartbeat(from) ⇒ triggerFirstHeartbeat(from)
   }
 
-  def reset(snapshot: CurrentClusterState): Unit =
-    state = state.reset(snapshot.members.collect { case m if m.address != selfAddress ⇒ m.address })
+  def reset(snapshot: InstantClusterState): Unit =
+    state = state.reset(snapshot.members.map(_.address))
 
   def addMember(m: Member): Unit = if (m.address != selfAddress)
     state = state addMember m.address
@@ -131,11 +152,26 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
   def removeMember(m: Member): Unit = if (m.address != selfAddress)
     state = state removeMember m.address
 
-  def addJoinInProgress(address: Address, deadline: Deadline): Unit = if (address != selfAddress)
-    state = state.addJoinInProgress(address, deadline)
+  def addHeartbeatRequest(address: Address): Unit = if (address != selfAddress)
+    state = state.addHeartbeatRequest(address, Deadline.now + HeartbeatRequestTimeout)
+
+  def sendHeartbeatRequest(address: Address): Unit =
+    if (!cluster.failureDetector.monitoringStarted(address) && state.ring.mySenders.contains(address)) {
+      heartbeatSenderFor(address) ! selfHeartbeatRequest
+      // schedule the expected heartbeat for later, which will give the
+      // sender a chance to start heartbeating, and also trigger some resends of
+      // the heartbeat request
+      scheduler.scheduleOnce(HeartbeatInterval * 3, self, ExpectedFirstHeartbeat(address))
+    }
+
+  def triggerFirstHeartbeat(address: Address): Unit =
+    if (!cluster.failureDetector.monitoringStarted(address)) {
+      log.info("Trigger extra expected heartbeat from [{}]", address)
+      cluster.failureDetector.heartbeat(address)
+    }
 
   def heartbeat(): Unit = {
-    state = state.removeOverdueJoinInProgress()
+    state = state.removeOverdueHeartbeatRequest()
 
     def connection(to: Address): ActorRef = {
       // URL encoded target address as child actor name
@@ -161,6 +197,13 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
       } else
         state = state.increaseEndingCount(to)
     }
+
+    // request heartbeats from expected sender node if no heartbeat messages has been received
+    state.ring.mySenders foreach { address ⇒
+      if (!cluster.failureDetector.monitoringStarted(address))
+        scheduler.scheduleOnce(HeartbeatRequestDelay, self, SendHeartbeatRequest(address))
+    }
+
   }
 
 }
@@ -172,9 +215,8 @@ private[cluster] object ClusterHeartbeatSenderState {
   /**
    * Initial, empty state
    */
-  def empty(consistentHash: ConsistentHash[Address], selfAddressStr: String,
-            monitoredByNrOfMembers: Int): ClusterHeartbeatSenderState =
-    ClusterHeartbeatSenderState(consistentHash, selfAddressStr, monitoredByNrOfMembers)
+  def empty(selfAddress: Address, monitoredByNrOfMembers: Int): ClusterHeartbeatSenderState =
+    ClusterHeartbeatSenderState(HeartbeatNodeRing(selfAddress, Set(selfAddress), monitoredByNrOfMembers))
 
   /**
    * Create a new state based on previous state, and
@@ -182,33 +224,13 @@ private[cluster] object ClusterHeartbeatSenderState {
    */
   private def apply(
     old: ClusterHeartbeatSenderState,
-    consistentHash: ConsistentHash[Address],
-    all: Set[Address]): ClusterHeartbeatSenderState = {
+    ring: HeartbeatNodeRing): ClusterHeartbeatSenderState = {
 
-    /**
-     * Select a few peers that heartbeats will be sent to, i.e. that will
-     * monitor this node. Try to send heartbeats to same nodes as much
-     * as possible, but re-balance with consistent hashing algorithm when
-     * new members are added or removed.
-     */
-    def selectPeers: Set[Address] = {
-      val allSize = all.size
-      val nrOfPeers = math.min(allSize, old.monitoredByNrOfMembers)
-      // try more if consistentHash results in same node as already selected
-      val attemptLimit = nrOfPeers * 2
-      @tailrec def select(acc: Set[Address], n: Int): Set[Address] = {
-        if (acc.size == nrOfPeers || n == attemptLimit) acc
-        else select(acc + consistentHash.nodeFor(old.selfAddressStr + n), n + 1)
-      }
-      if (nrOfPeers >= allSize) all
-      else select(Set.empty[Address], 0)
-    }
-
-    val curr = selectPeers
+    val curr = ring.myReceivers
     // start ending process for nodes not selected any more
     // abort ending process for nodes that have been selected again
     val end = old.ending ++ (old.current -- curr).map(_ -> 0) -- curr
-    old.copy(consistentHash = consistentHash, all = all, current = curr, ending = end)
+    old.copy(ring = ring, current = curr, ending = end)
   }
 
 }
@@ -223,13 +245,10 @@ private[cluster] object ClusterHeartbeatSenderState {
  * i.e. the methods return new instances.
  */
 private[cluster] case class ClusterHeartbeatSenderState private (
-  consistentHash: ConsistentHash[Address],
-  selfAddressStr: String,
-  monitoredByNrOfMembers: Int,
-  all: Set[Address] = Set.empty,
+  ring: HeartbeatNodeRing,
   current: Set[Address] = Set.empty,
   ending: Map[Address, Int] = Map.empty,
-  joinInProgress: Map[Address, Deadline] = Map.empty) {
+  heartbeatRequest: Map[Address, Deadline] = Map.empty) {
 
   // FIXME can be disabled as optimization
   assertInvariants
@@ -237,50 +256,43 @@ private[cluster] case class ClusterHeartbeatSenderState private (
   private def assertInvariants: Unit = {
     val currentAndEnding = current.intersect(ending.keySet)
     require(currentAndEnding.isEmpty,
-      "Same nodes in current and ending not allowed, got [%s]" format currentAndEnding)
-    val joinInProgressAndAll = joinInProgress.keySet.intersect(all)
-    require(joinInProgressAndAll.isEmpty,
-      "Same nodes in joinInProgress and all not allowed, got [%s]" format joinInProgressAndAll)
-    val currentNotInAll = current -- all
-    require(currentNotInAll.isEmpty,
-      "Nodes in current but not in all not allowed, got [%s]" format currentNotInAll)
-    require(all.isEmpty == consistentHash.isEmpty, "ConsistentHash doesn't correspond to all nodes [%s]"
-      format all)
+      s"Same nodes in current and ending not allowed, got [${currentAndEnding}]")
+    val currentNotInAll = current -- ring.nodes
+    require(current.isEmpty || currentNotInAll.isEmpty,
+      s"Nodes in current but not in ring nodes not allowed, got current [${current}] not in [${ring.nodes}], unexpected [${currentNotInAll}]")
   }
 
-  val active: Set[Address] = current ++ joinInProgress.keySet
+  val active: Set[Address] = current ++ heartbeatRequest.keySet
 
-  def reset(nodes: Set[Address]): ClusterHeartbeatSenderState =
-    ClusterHeartbeatSenderState(nodes.foldLeft(this) { _ removeJoinInProgress _ },
-      consistentHash = ConsistentHash(nodes, consistentHash.virtualNodesFactor),
-      all = nodes)
+  def reset(nodes: Set[Address]): ClusterHeartbeatSenderState = {
+    ClusterHeartbeatSenderState(nodes.foldLeft(this) { _ removeHeartbeatRequest _ }, ring.copy(nodes = nodes + ring.selfAddress))
+  }
 
   def addMember(a: Address): ClusterHeartbeatSenderState =
-    ClusterHeartbeatSenderState(removeJoinInProgress(a), all = all + a, consistentHash = consistentHash :+ a)
+    ClusterHeartbeatSenderState(removeHeartbeatRequest(a), ring :+ a)
 
   def removeMember(a: Address): ClusterHeartbeatSenderState =
-    ClusterHeartbeatSenderState(removeJoinInProgress(a), all = all - a, consistentHash = consistentHash :- a)
+    ClusterHeartbeatSenderState(removeHeartbeatRequest(a), ring :- a)
 
-  private def removeJoinInProgress(address: Address): ClusterHeartbeatSenderState = {
-    if (joinInProgress contains address)
-      copy(joinInProgress = joinInProgress - address, ending = ending + (address -> 0))
+  private def removeHeartbeatRequest(address: Address): ClusterHeartbeatSenderState = {
+    if (heartbeatRequest contains address)
+      copy(heartbeatRequest = heartbeatRequest - address, ending = ending + (address -> 0))
     else this
   }
 
-  def addJoinInProgress(address: Address, deadline: Deadline): ClusterHeartbeatSenderState = {
-    if (all contains address) this
-    else copy(joinInProgress = joinInProgress + (address -> deadline), ending = ending - address)
+  def addHeartbeatRequest(address: Address, deadline: Deadline): ClusterHeartbeatSenderState = {
+    if (current.contains(address)) this
+    else copy(heartbeatRequest = heartbeatRequest + (address -> deadline), ending = ending - address)
   }
 
   /**
-   * Cleanup overdue joinInProgress, in case a joining node never
-   * became member, for some reason.
+   * Cleanup overdue heartbeatRequest
    */
-  def removeOverdueJoinInProgress(): ClusterHeartbeatSenderState = {
-    val overdue = joinInProgress collect { case (address, deadline) if deadline.isOverdue ⇒ address }
+  def removeOverdueHeartbeatRequest(): ClusterHeartbeatSenderState = {
+    val overdue = heartbeatRequest collect { case (address, deadline) if deadline.isOverdue ⇒ address }
     if (overdue.isEmpty) this
     else
-      copy(ending = ending ++ overdue.map(_ -> 0), joinInProgress = joinInProgress -- overdue)
+      copy(ending = ending ++ overdue.map(_ -> 0), heartbeatRequest = heartbeatRequest -- overdue)
   }
 
   def removeEnding(a: Address): ClusterHeartbeatSenderState = copy(ending = ending - a)
@@ -349,4 +361,78 @@ private[cluster] final class ClusterHeartbeatSenderConnection(toRef: ActorRef)
       log.debug("Cluster Node [{}] - EndHeartbeat to [{}]", endHeartbeatMsg.from, toRef)
       toRef ! endHeartbeatMsg
   }
+}
+
+/**
+ * INTERNAL API
+ *
+ * Data structure for picking heartbeat receivers and keep track of what nodes
+ * that are expected to send heartbeat messages to a node. The node ring is
+ * shuffled by deterministic hashing to avoid picking physically co-located
+ * neighbors.
+ *
+ * It is immutable, i.e. the methods return new instances.
+ */
+private[cluster] case class HeartbeatNodeRing(selfAddress: Address, nodes: Set[Address], monitoredByNrOfMembers: Int) {
+
+  require(nodes contains selfAddress, s"nodes [${nodes.mkString(", ")}] must contain selfAddress [${selfAddress}]")
+
+  private val (hashToIndex: Map[Int, Int], nodeRing: Vector[Address]) = {
+    val nodesByHash: immutable.SortedMap[Int, Address] = immutable.SortedMap.empty[Int, Address] ++
+      nodes.map(node ⇒ hashFor(node) -> node)
+
+    val (nodeHashRing: Vector[Int], nodeRing: Vector[Address]) = nodesByHash.toVector.unzip
+    val hashToIndex = nodeHashRing.zipWithIndex.toMap
+    (hashToIndex, nodeRing)
+  }
+
+  /**
+   * Receivers for `selfAddress`. Cached for subsequent access.
+   */
+  lazy val myReceivers: immutable.Set[Address] = receivers(selfAddress)
+  /**
+   * Senders for `selfAddress`. Cached for subsequent access.
+   */
+  lazy val mySenders: immutable.Set[Address] = senders(selfAddress)
+
+  /**
+   * The receivers to use from a specified sender.
+   */
+  def receivers(sender: Address): immutable.Set[Address] =
+    if (monitoredByNrOfMembers >= (nodeRing.length - 1))
+      nodeRing.to[immutable.Set] - sender
+    else {
+      val n = hashToIndex(hashFor(sender)) + 1
+      val slice = nodeRing.slice(n, n + monitoredByNrOfMembers)
+      if (slice.size < monitoredByNrOfMembers)
+        (slice ++ nodeRing.take(monitoredByNrOfMembers - slice.size)).toSet
+      else slice.toSet
+    }
+
+  /**
+   * The expected senders for a specific receiver.
+   */
+  def senders(receiver: Address): Set[Address] = {
+    for {
+      snd ← nodes
+      rcv ← receivers(snd)
+      if rcv == receiver
+    } yield snd
+  }
+
+  private def hashFor(node: Address): Int = (node.host, node.port) match {
+    case (Some(h), Some(p)) ⇒ MurmurHash.stringHash(s"${h}:${p}")
+    case _                  ⇒ 0
+  }
+
+  /**
+   * Add a node to the ring.
+   */
+  def :+(node: Address): HeartbeatNodeRing = copy(nodes = nodes + node)
+
+  /**
+   * Remove a node from the ring.
+   */
+  def :-(node: Address): HeartbeatNodeRing = copy(nodes = nodes - node)
+
 }

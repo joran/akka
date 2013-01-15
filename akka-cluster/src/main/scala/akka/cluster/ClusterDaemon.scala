@@ -181,7 +181,6 @@ private[cluster] final class ClusterDaemon(settings: ClusterSettings) extends Ac
 private[cluster] final class ClusterCoreDaemon(publisher: ActorRef) extends Actor with ActorLogging {
   import ClusterLeaderAction._
   import InternalClusterAction._
-  import ClusterHeartbeatSender.JoinInProgress
 
   val cluster = Cluster(context.system)
   import cluster.{ selfAddress, scheduler, failureDetector }
@@ -290,7 +289,6 @@ private[cluster] final class ClusterCoreDaemon(publisher: ActorRef) extends Acto
       publisher ! PublishStart
 
       publish(latestGossip)
-      heartbeatSender ! JoinInProgress(address, Deadline.now + JoinTimeout)
 
       context.become(initialized)
       if (address == selfAddress)
