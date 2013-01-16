@@ -40,12 +40,16 @@ class ClusterSettings(val config: Config, val systemName: String) {
     require(d > Duration.Zero, "failure-detector.heartbeat-interval must be > 0"); d
   }
   final val HeartbeatRequestDelay: FiniteDuration = {
-    val d = Duration(getMilliseconds("akka.cluster.failure-detector.heartbeat-request-delay"), MILLISECONDS)
-    require(d > Duration.Zero, "failure-detector.heartbeat-request-delay must be > 0"); d
+    val d = Duration(getMilliseconds("akka.cluster.failure-detector.heartbeat-request.grace-period"), MILLISECONDS)
+    require(d > Duration.Zero, "failure-detector.heartbeat-request.grace-period must be > 0"); d
   }
-  final val HeartbeatRequestTimeout: FiniteDuration = {
-    val d = Duration(getMilliseconds("akka.cluster.failure-detector.heartbeat-request-timeout"), MILLISECONDS)
-    require(d > Duration.Zero, "failure-detector.heartbeat-request-timeout must be > 0"); d
+  final val HeartbeatExpectedResponseAfter: FiniteDuration = {
+    val d = Duration(getMilliseconds("akka.cluster.failure-detector.heartbeat-request.expected-response-after"), MILLISECONDS)
+    require(d > Duration.Zero, "failure-detector.heartbeat-request.expected-response-after > 0"); d
+  }
+  final val HeartbeatRequestTimeToLive: FiniteDuration = {
+    val d = Duration(getMilliseconds("akka.cluster.failure-detector.heartbeat-request.time-to-live"), MILLISECONDS)
+    require(d > Duration.Zero, "failure-detector.heartbeat-request.time-to-live > 0"); d
   }
   final val NumberOfEndHeartbeats: Int = (FailureDetectorAcceptableHeartbeatPause / HeartbeatInterval + 5).toInt
   final val MonitoredByNrOfMembers: Int = {

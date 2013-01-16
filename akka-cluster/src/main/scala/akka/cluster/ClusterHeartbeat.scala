@@ -137,7 +137,7 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
     case InstantMemberRemoved(m)      ⇒ removeMember(m)
     case s: InstantClusterState       ⇒ reset(s)
     case _: CurrentClusterState       ⇒ // enough with InstantClusterState
-    case _: InstantMemberEvent        ⇒
+    case _: InstantMemberEvent        ⇒ // not interested in other types of InstantMemberEvent
     case HeartbeatRequest(from)       ⇒ addHeartbeatRequest(from)
     case SendHeartbeatRequest(to)     ⇒ sendHeartbeatRequest(to)
     case ExpectedFirstHeartbeat(from) ⇒ triggerFirstHeartbeat(from)
@@ -153,19 +153,19 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
     state = state removeMember m.address
 
   def addHeartbeatRequest(address: Address): Unit = if (address != selfAddress)
-    state = state.addHeartbeatRequest(address, Deadline.now + HeartbeatRequestTimeout)
+    state = state.addHeartbeatRequest(address, Deadline.now + HeartbeatRequestTimeToLive)
 
   def sendHeartbeatRequest(address: Address): Unit =
-    if (!cluster.failureDetector.monitoringStarted(address) && state.ring.mySenders.contains(address)) {
+    if (!cluster.failureDetector.isMonitoring(address) && state.ring.mySenders.contains(address)) {
       heartbeatSenderFor(address) ! selfHeartbeatRequest
       // schedule the expected heartbeat for later, which will give the
       // sender a chance to start heartbeating, and also trigger some resends of
       // the heartbeat request
-      scheduler.scheduleOnce(HeartbeatInterval * 3, self, ExpectedFirstHeartbeat(address))
+      scheduler.scheduleOnce(HeartbeatExpectedResponseAfter, self, ExpectedFirstHeartbeat(address))
     }
 
   def triggerFirstHeartbeat(address: Address): Unit =
-    if (!cluster.failureDetector.monitoringStarted(address)) {
+    if (!cluster.failureDetector.isMonitoring(address)) {
       log.info("Trigger extra expected heartbeat from [{}]", address)
       cluster.failureDetector.heartbeat(address)
     }
@@ -200,7 +200,7 @@ private[cluster] final class ClusterHeartbeatSender extends Actor with ActorLogg
 
     // request heartbeats from expected sender node if no heartbeat messages has been received
     state.ring.mySenders foreach { address ⇒
-      if (!cluster.failureDetector.monitoringStarted(address))
+      if (!cluster.failureDetector.isMonitoring(address))
         scheduler.scheduleOnce(HeartbeatRequestDelay, self, SendHeartbeatRequest(address))
     }
 
@@ -230,7 +230,7 @@ private[cluster] object ClusterHeartbeatSenderState {
     // start ending process for nodes not selected any more
     // abort ending process for nodes that have been selected again
     val end = old.ending ++ (old.current -- curr).map(_ -> 0) -- curr
-    old.copy(ring = ring, current = curr, ending = end)
+    old.copy(ring = ring, current = curr, ending = end, heartbeatRequest = old.heartbeatRequest -- curr)
   }
 
 }
@@ -257,9 +257,15 @@ private[cluster] case class ClusterHeartbeatSenderState private (
     val currentAndEnding = current.intersect(ending.keySet)
     require(currentAndEnding.isEmpty,
       s"Same nodes in current and ending not allowed, got [${currentAndEnding}]")
+    val currentAndHeartbeatRequest = current.intersect(heartbeatRequest.keySet)
+    require(currentAndHeartbeatRequest.isEmpty,
+      s"Same nodes in current and heartbeatRequest not allowed, got [${currentAndEnding}]")
     val currentNotInAll = current -- ring.nodes
     require(current.isEmpty || currentNotInAll.isEmpty,
-      s"Nodes in current but not in ring nodes not allowed, got current [${current}] not in [${ring.nodes}], unexpected [${currentNotInAll}]")
+      s"Nodes in current but not in ring nodes not allowed, got [${currentNotInAll}]")
+    require(!current.contains(ring.selfAddress), s"Self in current not allowed, got [${ring.selfAddress}]")
+    require(!heartbeatRequest.contains(ring.selfAddress),
+      s"Self in heartbeatRequest not allowed, got [${ring.selfAddress}]")
   }
 
   val active: Set[Address] = current ++ heartbeatRequest.keySet
@@ -342,7 +348,7 @@ private[cluster] final class ClusterHeartbeatSenderConnection(toRef: ActorRef)
     CircuitBreaker(context.system.scheduler,
       cbSettings.maxFailures, cbSettings.callTimeout, cbSettings.resetTimeout).
       onHalfOpen(log.debug("CircuitBreaker Half-Open for: [{}]", toRef)).
-      onOpen(log.debug("CircuitBreaker Open for [{}]", toRef)).
+      onOpen(log.info("CircuitBreaker Open for [{}]", toRef)).
       onClose(log.debug("CircuitBreaker Closed for [{}]", toRef))
   }
 
@@ -356,7 +362,7 @@ private[cluster] final class ClusterHeartbeatSenderConnection(toRef: ActorRef)
           toRef ! heartbeatMsg
         } catch { case e: CircuitBreakerOpenException ⇒ /* skip sending heartbeat to broken connection */ }
       }
-      if (deadline.isOverdue) log.debug("Sending heartbeat to [{}] took longer than expected", toRef)
+      if (deadline.isOverdue) log.info("Sending heartbeat to [{}] took longer than expected", toRef)
     case SendEndHeartbeat(endHeartbeatMsg, _) ⇒
       log.debug("Cluster Node [{}] - EndHeartbeat to [{}]", endHeartbeatMsg.from, toRef)
       toRef ! endHeartbeatMsg
@@ -377,14 +383,23 @@ private[cluster] case class HeartbeatNodeRing(selfAddress: Address, nodes: Set[A
 
   require(nodes contains selfAddress, s"nodes [${nodes.mkString(", ")}] must contain selfAddress [${selfAddress}]")
 
-  private val (hashToIndex: Map[Int, Int], nodeRing: Vector[Address]) = {
-    val nodesByHash: immutable.SortedMap[Int, Address] = immutable.SortedMap.empty[Int, Address] ++
-      nodes.map(node ⇒ hashFor(node) -> node)
+  private val nodeRing: Vector[Address] = {
+    implicit val ringOrdering: Ordering[Address] = Ordering.fromLessThan[Address] { (a, b) ⇒
+      if (hashFor(a) < hashFor(b)) true
+      else Member.addressOrdering.compare(a, b) < 0
+    }
 
-    val (nodeHashRing: Vector[Int], nodeRing: Vector[Address]) = nodesByHash.toVector.unzip
-    val hashToIndex = nodeHashRing.zipWithIndex.toMap
-    (hashToIndex, nodeRing)
+    nodes.toVector.sorted
   }
+
+  private def hashFor(node: Address): Int = (node.host, node.port) match {
+    // cluster node identifier is the host and port of the address; protocol and system is assumed to be the same
+    case (Some(h), Some(p)) ⇒ MurmurHash.stringHash(s"${h}:${p}")
+    case _                  ⇒ 0
+  }
+
+  // Mapping from Address to index into `nodeRing` for quick lookup
+  private val addressToIndex: Map[Address, Int] = nodeRing.zipWithIndex.toMap
 
   /**
    * Receivers for `selfAddress`. Cached for subsequent access.
@@ -402,7 +417,7 @@ private[cluster] case class HeartbeatNodeRing(selfAddress: Address, nodes: Set[A
     if (monitoredByNrOfMembers >= (nodeRing.length - 1))
       nodeRing.to[immutable.Set] - sender
     else {
-      val n = hashToIndex(hashFor(sender)) + 1
+      val n = addressToIndex(sender) + 1
       val slice = nodeRing.slice(n, n + monitoredByNrOfMembers)
       if (slice.size < monitoredByNrOfMembers)
         (slice ++ nodeRing.take(monitoredByNrOfMembers - slice.size)).toSet
@@ -412,27 +427,17 @@ private[cluster] case class HeartbeatNodeRing(selfAddress: Address, nodes: Set[A
   /**
    * The expected senders for a specific receiver.
    */
-  def senders(receiver: Address): Set[Address] = {
-    for {
-      snd ← nodes
-      rcv ← receivers(snd)
-      if rcv == receiver
-    } yield snd
-  }
-
-  private def hashFor(node: Address): Int = (node.host, node.port) match {
-    case (Some(h), Some(p)) ⇒ MurmurHash.stringHash(s"${h}:${p}")
-    case _                  ⇒ 0
-  }
+  def senders(receiver: Address): Set[Address] =
+    nodes filter { sender ⇒ receivers(sender) contains receiver }
 
   /**
    * Add a node to the ring.
    */
-  def :+(node: Address): HeartbeatNodeRing = copy(nodes = nodes + node)
+  def :+(node: Address): HeartbeatNodeRing = if (nodes contains node) this else copy(nodes = nodes + node)
 
   /**
    * Remove a node from the ring.
    */
-  def :-(node: Address): HeartbeatNodeRing = copy(nodes = nodes - node)
+  def :-(node: Address): HeartbeatNodeRing = if (nodes contains node) copy(nodes = nodes - node) else this
 
 }

@@ -23,7 +23,7 @@ trait FailureDetectorRegistry[A] {
    * Returns true if the failure detector has received any heartbeats and started monitoring
    * of the resource.
    */
-  def monitoringStarted(resource: A): Boolean
+  def isMonitoring(resource: A): Boolean
 
   /**
    * Records a heartbeat for a resource. If the resource is not yet registered (i.e. this is the first heartbeat) then

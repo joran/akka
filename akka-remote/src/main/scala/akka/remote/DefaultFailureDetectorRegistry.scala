@@ -26,8 +26,8 @@ class DefaultFailureDetectorRegistry[A](val detectorFactory: () ⇒ FailureDetec
     case _       ⇒ true
   }
 
-  final override def monitoringStarted(resource: A): Boolean = resourceToFailureDetector.get.get(resource) match {
-    case Some(r) ⇒ r.monitoringStarted
+  final override def isMonitoring(resource: A): Boolean = resourceToFailureDetector.get.get(resource) match {
+    case Some(r) ⇒ r.isMonitoring
     case _       ⇒ false
   }
 

@@ -91,7 +91,7 @@ private[cluster] class ClusterMetricsCollector(publisher: ActorRef) extends Acto
     case InstantMemberDowned(m)     ⇒ removeMember(m)
     case InstantMemberRemoved(m)    ⇒ removeMember(m)
     case UnreachableMember(m)       ⇒ removeMember(m)
-    case _: InstantMemberEvent      ⇒
+    case _: InstantMemberEvent      ⇒ // not interested in other types of InstantMemberEvent
 
   }
 

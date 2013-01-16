@@ -329,7 +329,6 @@ private[cluster] final class ClusterCoreDaemon(publisher: ActorRef) extends Acto
       log.debug("Cluster Node [{}] - Node [{}] is JOINING", selfAddress, node)
       // treat join as initial heartbeat, so that it becomes unavailable if nothing more happens
       if (node != selfAddress) {
-        failureDetector heartbeat node
         gossipTo(node)
       }
 

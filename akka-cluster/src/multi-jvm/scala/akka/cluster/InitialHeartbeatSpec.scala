@@ -21,7 +21,7 @@ object InitialHeartbeatMultiJvmSpec extends MultiNodeConfig {
 
   commonConfig(debugConfig(on = false).
     withFallback(ConfigFactory.parseString("""
-      akka.cluster.failure-detector.heartbeat-request-delay = 3 s
+      akka.cluster.failure-detector.heartbeat-request.grace-period = 3 s
       akka.cluster.failure-detector.threshold = 4""")).
     withFallback(MultiNodeClusterSpec.clusterConfig))
 }
